@@ -7,11 +7,17 @@
 (define-constant ERR_CANNOT_VERIFY_OWN (err u105))
 (define-constant ERR_REPUTATION_NOT_FOUND (err u106))
 (define-constant ERR_INVALID_REPUTATION_ACTION (err u107))
+(define-constant ERR_INSUFFICIENT_REWARD_BALANCE (err u108))
+(define-constant ERR_INVALID_REWARD_RATE (err u109))
+(define-constant ERR_REWARD_POOL_NOT_FOUND (err u110))
+(define-constant ERR_INSUFFICIENT_TOKENS (err u111))
 
 (define-data-var next-log-id uint u1)
 (define-data-var total-volunteer-hours uint u0)
 (define-data-var reputation-decay-blocks uint u144)
 (define-data-var base-reputation-score uint u100)
+(define-data-var default-reward-rate uint u10)
+(define-data-var total-tokens-distributed uint u0)
 
 (define-map volunteer-logs
   uint
@@ -98,10 +104,55 @@
   }
 )
 
+(define-map reward-pools
+  principal
+  {
+    total-balance: uint,
+    available-balance: uint,
+    tokens-distributed: uint,
+    reward-rate: uint,
+    skill-multipliers: (list 5 { skill: (string-ascii 30), multiplier: uint }),
+    pool-active: bool,
+    last-updated: uint
+  }
+)
+
+(define-map volunteer-token-balances
+  principal
+  {
+    earned-tokens: uint,
+    withdrawn-tokens: uint,
+    available-tokens: uint,
+    last-reward-block: uint
+  }
+)
+
+(define-map skill-categories
+  uint
+  {
+    name: (string-ascii 30),
+    base-multiplier: uint,
+    description: (string-ascii 100)
+  }
+)
+
+(define-map token-distribution-history
+  { volunteer: principal, distribution-id: uint }
+  {
+    amount: uint,
+    organization: principal,
+    hours: uint,
+    skill-category: (string-ascii 30),
+    block-height: uint,
+    log-id: uint
+  }
+)
+
 (define-public (register-organization (verifiers (list 10 principal)))
   (begin
     (map-set organization-verifiers tx-sender verifiers)
     (initialize-reputation-tiers)
+    (initialize-skill-categories)
     (ok true)
   )
 )
@@ -116,11 +167,75 @@
   )
 )
 
+(define-private (initialize-skill-categories)
+  (begin
+    (map-set skill-categories u1 { name: "General", base-multiplier: u100, description: "General volunteer work" })
+    (map-set skill-categories u2 { name: "Technical", base-multiplier: u150, description: "Technical and IT support" })
+    (map-set skill-categories u3 { name: "Education", base-multiplier: u130, description: "Teaching and training" })
+    (map-set skill-categories u4 { name: "Healthcare", base-multiplier: u140, description: "Medical and health services" })
+    (map-set skill-categories u5 { name: "Emergency", base-multiplier: u200, description: "Emergency response work" })
+  )
+)
+
 (define-public (add-verifier (organization principal) (verifier principal))
   (let ((current-verifiers (default-to (list) (map-get? organization-verifiers organization))))
     (asserts! (is-eq tx-sender organization) ERR_UNAUTHORIZED)
     (map-set organization-verifiers organization (unwrap-panic (as-max-len? (append current-verifiers verifier) u10)))
     (ok true)
+  )
+)
+
+(define-public (create-reward-pool (initial-balance uint) (reward-rate uint))
+  (begin
+    (asserts! (> initial-balance u0) ERR_INSUFFICIENT_REWARD_BALANCE)
+    (asserts! (> reward-rate u0) ERR_INVALID_REWARD_RATE)
+    (map-set reward-pools tx-sender {
+      total-balance: initial-balance,
+      available-balance: initial-balance,
+      tokens-distributed: u0,
+      reward-rate: reward-rate,
+      skill-multipliers: (list),
+      pool-active: true,
+      last-updated: stacks-block-height
+    })
+    (ok true)
+  )
+)
+
+(define-public (fund-reward-pool (additional-amount uint))
+  (let ((current-pool (unwrap! (map-get? reward-pools tx-sender) ERR_REWARD_POOL_NOT_FOUND)))
+    (asserts! (> additional-amount u0) ERR_INSUFFICIENT_REWARD_BALANCE)
+    (map-set reward-pools tx-sender (merge current-pool {
+      total-balance: (+ (get total-balance current-pool) additional-amount),
+      available-balance: (+ (get available-balance current-pool) additional-amount),
+      last-updated: stacks-block-height
+    }))
+    (ok true)
+  )
+)
+
+(define-public (set-skill-multiplier (skill-name (string-ascii 30)) (multiplier uint))
+  (let ((current-pool (unwrap! (map-get? reward-pools tx-sender) ERR_REWARD_POOL_NOT_FOUND))
+        (new-skill-entry { skill: skill-name, multiplier: multiplier })
+        (current-multipliers (get skill-multipliers current-pool)))
+    (asserts! (> multiplier u0) ERR_INVALID_REWARD_RATE)
+    (map-set reward-pools tx-sender (merge current-pool {
+      skill-multipliers: (unwrap-panic (as-max-len? (append current-multipliers new-skill-entry) u5)),
+      last-updated: stacks-block-height
+    }))
+    (ok true)
+  )
+)
+
+(define-public (withdraw-tokens (amount uint))
+  (let ((current-balance (default-to { earned-tokens: u0, withdrawn-tokens: u0, available-tokens: u0, last-reward-block: u0 } 
+                                    (map-get? volunteer-token-balances tx-sender))))
+    (asserts! (<= amount (get available-tokens current-balance)) ERR_INSUFFICIENT_TOKENS)
+    (map-set volunteer-token-balances tx-sender (merge current-balance {
+      withdrawn-tokens: (+ (get withdrawn-tokens current-balance) amount),
+      available-tokens: (- (get available-tokens current-balance) amount)
+    }))
+    (ok amount)
   )
 )
 
@@ -169,6 +284,7 @@
     (update-organization-stats (get organization log-data) (get hours log-data) true)
     (var-set total-volunteer-hours (+ (var-get total-volunteer-hours) (get hours log-data)))
     (update-volunteer-reputation-on-verification (get volunteer log-data) (get hours log-data))
+    (distribute-tokens-for-verified-work (get volunteer log-data) (get organization log-data) (get hours log-data) log-id)
     
     (ok true)
   )
@@ -430,3 +546,117 @@
     u100
   )
 )
+
+(define-private (distribute-tokens-for-verified-work (volunteer principal) (organization principal) (hours uint) (log-id uint))
+  (match (map-get? reward-pools organization)
+    pool-data 
+    (if (get pool-active pool-data)
+      (let (
+        (base-reward (* hours (get reward-rate pool-data)))
+        (skill-multiplier (get-skill-multiplier-for-general))
+        (reputation-multiplier (calculate-reputation-multiplier volunteer))
+        (final-reward (/ (* (* base-reward skill-multiplier) reputation-multiplier) u10000))
+        (current-balance (default-to { earned-tokens: u0, withdrawn-tokens: u0, available-tokens: u0, last-reward-block: u0 }
+                                    (map-get? volunteer-token-balances volunteer)))
+        (distribution-id (get earned-tokens current-balance))
+      )
+        (if (>= (get available-balance pool-data) final-reward)
+          (begin
+            (map-set reward-pools organization (merge pool-data {
+              available-balance: (- (get available-balance pool-data) final-reward),
+              tokens-distributed: (+ (get tokens-distributed pool-data) final-reward),
+              last-updated: stacks-block-height
+            }))
+            (map-set volunteer-token-balances volunteer {
+              earned-tokens: (+ (get earned-tokens current-balance) final-reward),
+              withdrawn-tokens: (get withdrawn-tokens current-balance),
+              available-tokens: (+ (get available-tokens current-balance) final-reward),
+              last-reward-block: stacks-block-height
+            })
+            (map-set token-distribution-history 
+              { volunteer: volunteer, distribution-id: distribution-id }
+              {
+                amount: final-reward,
+                organization: organization,
+                hours: hours,
+                skill-category: "General",
+                block-height: stacks-block-height,
+                log-id: log-id
+              }
+            )
+            (var-set total-tokens-distributed (+ (var-get total-tokens-distributed) final-reward))
+          )
+          false
+        )
+      )
+      false
+    )
+    false
+  )
+)
+
+(define-private (get-skill-multiplier-for-general)
+  u100
+)
+
+(define-public (deactivate-reward-pool)
+  (let ((current-pool (unwrap! (map-get? reward-pools tx-sender) ERR_REWARD_POOL_NOT_FOUND)))
+    (map-set reward-pools tx-sender (merge current-pool {
+      pool-active: false,
+      last-updated: stacks-block-height
+    }))
+    (ok true)
+  )
+)
+
+(define-public (activate-reward-pool)
+  (let ((current-pool (unwrap! (map-get? reward-pools tx-sender) ERR_REWARD_POOL_NOT_FOUND)))
+    (map-set reward-pools tx-sender (merge current-pool {
+      pool-active: true,
+      last-updated: stacks-block-height
+    }))
+    (ok true)
+  )
+)
+
+(define-read-only (get-reward-pool-info (organization principal))
+  (map-get? reward-pools organization)
+)
+
+(define-read-only (get-volunteer-token-balance (volunteer principal))
+  (map-get? volunteer-token-balances volunteer)
+)
+
+(define-read-only (get-skill-category-info (category-id uint))
+  (map-get? skill-categories category-id)
+)
+
+(define-read-only (get-token-distribution-history (volunteer principal) (distribution-id uint))
+  (map-get? token-distribution-history { volunteer: volunteer, distribution-id: distribution-id })
+)
+
+(define-read-only (get-total-tokens-distributed)
+  (var-get total-tokens-distributed)
+)
+
+(define-read-only (calculate-potential-reward (organization principal) (hours uint) (volunteer principal))
+  (match (map-get? reward-pools organization)
+    pool-data
+    (if (get pool-active pool-data)
+      (let (
+        (base-reward (* hours (get reward-rate pool-data)))
+        (skill-multiplier (get-skill-multiplier-for-general))
+        (reputation-multiplier (calculate-reputation-multiplier volunteer))
+        (final-reward (/ (* (* base-reward skill-multiplier) reputation-multiplier) u10000))
+      )
+        (some final-reward)
+      )
+      none
+    )
+    none
+  )
+)
+
+
+
+
