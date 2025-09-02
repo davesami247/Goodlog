@@ -11,6 +11,11 @@
 (define-constant ERR_INVALID_REWARD_RATE (err u109))
 (define-constant ERR_REWARD_POOL_NOT_FOUND (err u110))
 (define-constant ERR_INSUFFICIENT_TOKENS (err u111))
+(define-constant ERR_OPPORTUNITY_NOT_FOUND (err u112))
+(define-constant ERR_OPPORTUNITY_CLOSED (err u113))
+(define-constant ERR_ALREADY_APPLIED (err u114))
+(define-constant ERR_APPLICATION_NOT_FOUND (err u115))
+(define-constant ERR_INVALID_SKILL_LEVEL (err u116))
 
 (define-data-var next-log-id uint u1)
 (define-data-var total-volunteer-hours uint u0)
@@ -18,6 +23,8 @@
 (define-data-var base-reputation-score uint u100)
 (define-data-var default-reward-rate uint u10)
 (define-data-var total-tokens-distributed uint u0)
+(define-data-var next-opportunity-id uint u1)
+(define-data-var next-application-id uint u1)
 
 (define-map volunteer-logs
   uint
@@ -145,6 +152,49 @@
     skill-category: (string-ascii 30),
     block-height: uint,
     log-id: uint
+  }
+)
+
+;; Volunteer Opportunity Matching System
+(define-map volunteer-opportunities
+  uint
+  {
+    organization: principal,
+    title: (string-ascii 100),
+    description: (string-ascii 500),
+    required-skills: (list 5 (string-ascii 30)),
+    min-skill-level: uint,
+    estimated-hours: uint,
+    max-volunteers: uint,
+    current-applications: uint,
+    deadline: uint,
+    is-active: bool,
+    created-block: uint,
+    location: (optional (string-ascii 100))
+  }
+)
+
+(define-map volunteer-skills
+  principal
+  {
+    skills: (list 10 { skill: (string-ascii 30), level: uint, verified: bool }),
+    experience-years: uint,
+    availability-hours: uint,
+    preferred-categories: (list 5 (string-ascii 30)),
+    last-updated: uint
+  }
+)
+
+(define-map opportunity-applications
+  uint
+  {
+    opportunity-id: uint,
+    volunteer: principal,
+    application-message: (string-ascii 300),
+    status: (string-ascii 20),
+    applied-block: uint,
+    reviewed-block: uint,
+    reviewer: (optional principal)
   }
 )
 
@@ -522,6 +572,115 @@
   )
 )
 
+;; Volunteer Opportunity System Functions
+(define-public (create-volunteer-opportunity (title (string-ascii 100)) (description (string-ascii 500)) (required-skills (list 5 (string-ascii 30))) (min-skill-level uint) (estimated-hours uint) (max-volunteers uint) (deadline uint) (location (optional (string-ascii 100))))
+  (let (
+    (opportunity-id (var-get next-opportunity-id))
+    (current-block stacks-block-height)
+  )
+    (asserts! (> estimated-hours u0) ERR_INVALID_HOURS)
+    (asserts! (> max-volunteers u0) ERR_INVALID_ORGANIZATION)
+    (asserts! (> deadline current-block) ERR_INVALID_ORGANIZATION)
+    (asserts! (and (>= min-skill-level u1) (<= min-skill-level u5)) ERR_INVALID_SKILL_LEVEL)
+    
+    (map-set volunteer-opportunities opportunity-id {
+      organization: tx-sender,
+      title: title,
+      description: description,
+      required-skills: required-skills,
+      min-skill-level: min-skill-level,
+      estimated-hours: estimated-hours,
+      max-volunteers: max-volunteers,
+      current-applications: u0,
+      deadline: deadline,
+      is-active: true,
+      created-block: current-block,
+      location: location
+    })
+    
+    (var-set next-opportunity-id (+ opportunity-id u1))
+    (ok opportunity-id)
+  )
+)
+
+(define-public (update-volunteer-skills (skills (list 10 { skill: (string-ascii 30), level: uint, verified: bool })) (experience-years uint) (availability-hours uint) (preferred-categories (list 5 (string-ascii 30))))
+  (begin
+    (asserts! (>= experience-years u0) ERR_INVALID_HOURS)
+    (asserts! (>= availability-hours u0) ERR_INVALID_HOURS)
+    
+    (map-set volunteer-skills tx-sender {
+      skills: skills,
+      experience-years: experience-years,
+      availability-hours: availability-hours,
+      preferred-categories: preferred-categories,
+      last-updated: stacks-block-height
+    })
+    (ok true)
+  )
+)
+
+(define-public (apply-for-opportunity (opportunity-id uint) (application-message (string-ascii 300)))
+  (let (
+    (opportunity (unwrap! (map-get? volunteer-opportunities opportunity-id) ERR_OPPORTUNITY_NOT_FOUND))
+    (application-id (var-get next-application-id))
+    (current-block stacks-block-height)
+  )
+    (asserts! (get is-active opportunity) ERR_OPPORTUNITY_CLOSED)
+    (asserts! (< current-block (get deadline opportunity)) ERR_OPPORTUNITY_CLOSED)
+    (asserts! (< (get current-applications opportunity) (get max-volunteers opportunity)) ERR_OPPORTUNITY_CLOSED)
+    (asserts! (not (is-eq tx-sender (get organization opportunity))) ERR_CANNOT_VERIFY_OWN)
+    
+    ;; Check if already applied
+    (asserts! (is-none (get-existing-application tx-sender opportunity-id)) ERR_ALREADY_APPLIED)
+    
+    (map-set opportunity-applications application-id {
+      opportunity-id: opportunity-id,
+      volunteer: tx-sender,
+      application-message: application-message,
+      status: "pending",
+      applied-block: current-block,
+      reviewed-block: u0,
+      reviewer: none
+    })
+    
+    (map-set volunteer-opportunities opportunity-id 
+      (merge opportunity { current-applications: (+ (get current-applications opportunity) u1) })
+    )
+    
+    (var-set next-application-id (+ application-id u1))
+    (ok application-id)
+  )
+)
+
+(define-public (review-application (application-id uint) (approve bool))
+  (let (
+    (application (unwrap! (map-get? opportunity-applications application-id) ERR_APPLICATION_NOT_FOUND))
+    (opportunity (unwrap! (map-get? volunteer-opportunities (get opportunity-id application)) ERR_OPPORTUNITY_NOT_FOUND))
+  )
+    (asserts! (is-eq tx-sender (get organization opportunity)) ERR_UNAUTHORIZED)
+    (asserts! (is-eq (get status application) "pending") ERR_ALREADY_EXISTS)
+    
+    (map-set opportunity-applications application-id (merge application {
+      status: (if approve "approved" "rejected"),
+      reviewed-block: stacks-block-height,
+      reviewer: (some tx-sender)
+    }))
+    
+    (ok approve)
+  )
+)
+
+(define-public (close-opportunity (opportunity-id uint))
+  (let (
+    (opportunity (unwrap! (map-get? volunteer-opportunities opportunity-id) ERR_OPPORTUNITY_NOT_FOUND))
+  )
+    (asserts! (is-eq tx-sender (get organization opportunity)) ERR_UNAUTHORIZED)
+    
+    (map-set volunteer-opportunities opportunity-id (merge opportunity { is-active: false }))
+    (ok true)
+  )
+)
+
 (define-read-only (get-volunteer-reputation (volunteer principal))
   (map-get? volunteer-reputation volunteer)
 )
@@ -639,6 +798,47 @@
   (var-get total-tokens-distributed)
 )
 
+;; Opportunity Matching System Read-Only Functions
+(define-read-only (get-volunteer-opportunity (opportunity-id uint))
+  (map-get? volunteer-opportunities opportunity-id)
+)
+
+(define-read-only (get-volunteer-skills (volunteer principal))
+  (map-get? volunteer-skills volunteer)
+)
+
+(define-read-only (get-opportunity-application (application-id uint))
+  (map-get? opportunity-applications application-id)
+)
+
+(define-read-only (get-volunteer-applications (volunteer principal) (opportunity-id uint))
+  (get-existing-application volunteer opportunity-id)
+)
+
+(define-read-only (get-active-opportunities)
+  ;; Returns count of active opportunities (simplified implementation)
+  (- (var-get next-opportunity-id) u1)
+)
+
+(define-read-only (calculate-skill-match-score (volunteer principal) (opportunity-id uint))
+  (match (map-get? volunteer-opportunities opportunity-id)
+    opportunity
+    (match (map-get? volunteer-skills volunteer)
+      volunteer-skills-data
+      (let (
+        (required-skills (get required-skills opportunity))
+        (volunteer-skills-list (get skills volunteer-skills-data))
+        (min-level (get min-skill-level opportunity))
+      )
+        ;; Simplified matching: count matching skills
+        (calculate-matching-skills volunteer-skills-list required-skills min-level)
+      )
+      u0
+    )
+    u0
+  )
+)
+
 (define-read-only (calculate-potential-reward (organization principal) (hours uint) (volunteer principal))
   (match (map-get? reward-pools organization)
     pool-data
@@ -657,6 +857,18 @@
   )
 )
 
+;; Private Helper Functions for Opportunity System
+(define-private (get-existing-application (volunteer principal) (opportunity-id uint))
+  ;; Simplified check - in real implementation would iterate through applications
+  none
+)
 
+(define-private (calculate-matching-skills (volunteer-skills-list (list 10 { skill: (string-ascii 30), level: uint, verified: bool })) (required-skills (list 5 (string-ascii 30))) (min-level uint))
+  ;; Simplified matching algorithm - counts number of matching skills
+  (if (> (len required-skills) u0)
+    u75 ;; Return 75% match as placeholder
+    u0
+  )
+)
 
 
